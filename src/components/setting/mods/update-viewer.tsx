@@ -1,5 +1,4 @@
 import { alpha, Box, Button, LinearProgress } from '@mui/material'
-import type { DownloadEvent } from '@tauri-apps/plugin-updater'
 import { useLockFn } from 'ahooks'
 import type { Ref } from 'react'
 import {
@@ -15,7 +14,13 @@ import type { Options as ReactMarkdownOptions } from 'react-markdown'
 
 import { BaseDialog, DialogRef } from '@/components/base'
 import { useUpdate } from '@/hooks/use-update'
-import { restartApp } from '@/services/cmds'
+import type { DownloadEvent } from '@/services/bindings'
+import {
+  cancelUpdateDownload,
+  installUpdate,
+  restartApp,
+} from '@/services/cmds'
+import { mutate } from '@/services/mutate'
 import { showNotice } from '@/services/notice-service'
 import { useSetUpdateState, useUpdateState } from '@/services/states'
 import { openExternalUrl } from '@/utils/open-external-url'
@@ -58,16 +63,50 @@ const GITHUB_ALERT_PATTERN =
   /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\][\t ]*\n?/i
 const GITHUB_ALERT_CLASS_PATTERN =
   /markdown-alert-(note|tip|important|warning|caution)/
+const UPDATE_MARKDOWN_ID_PREFIX = 'update-markdown-'
 
 const shouldShowReleaseNotes = (language: string) => language === 'zh'
 
 const LazyReactMarkdown = lazy(async () => {
-  const [{ default: ReactMarkdown }, { default: rehypeRaw }] =
-    await Promise.all([import('react-markdown'), import('rehype-raw')])
+  const [
+    { default: ReactMarkdown },
+    { default: rehypeRaw },
+    { default: rehypeSanitize, defaultSchema },
+    { default: remarkGfm },
+  ] = await Promise.all([
+    import('react-markdown'),
+    import('rehype-raw'),
+    import('rehype-sanitize'),
+    import('remark-gfm'),
+  ])
+
+  const sanitizeSchema = {
+    ...defaultSchema,
+    clobberPrefix: UPDATE_MARKDOWN_ID_PREFIX,
+    attributes: {
+      ...defaultSchema.attributes,
+      blockquote: [
+        ...(defaultSchema.attributes?.blockquote ?? []),
+        [
+          'className',
+          'markdown-alert',
+          ...Object.keys(GITHUB_ALERTS).map((type) => `markdown-alert-${type}`),
+        ],
+      ],
+      p: [
+        ...(defaultSchema.attributes?.p ?? []),
+        ['className', 'markdown-alert-title'],
+      ],
+    },
+  }
 
   return {
     default: (props: ReactMarkdownOptions) => (
-      <ReactMarkdown {...props} rehypePlugins={[rehypeRaw]} />
+      <ReactMarkdown
+        {...props}
+        remarkPlugins={[remarkGfm, ...(props.remarkPlugins ?? [])]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
+      />
     ),
   }
 })
@@ -236,8 +275,19 @@ export function UpdateViewer({ ref }: { ref?: Ref<DialogRef> }) {
     }
 
     try {
-      await updateInfo.downloadAndInstall(onDownloadEvent)
-      await restartApp()
+      const result = await mutate(
+        () => installUpdate(updateInfo.version, onDownloadEvent),
+        {
+          id: 'install-app-update',
+          errorNotice: false,
+        },
+      )
+      if (result.ok && result.value) {
+        await mutate(() => restartApp(), {
+          id: 'restart-app',
+          errorNotice: false,
+        })
+      }
     } catch (err: any) {
       showNotice.error(err)
     } finally {
@@ -300,7 +350,15 @@ export function UpdateViewer({ ref }: { ref?: Ref<DialogRef> }) {
       okBtn={t('settings.modals.update.actions.update')}
       cancelBtn={t('shared.actions.cancel')}
       onClose={() => setOpen(false)}
-      onCancel={() => setOpen(false)}
+      onCancel={() => {
+        if (updateState) {
+          void mutate(() => cancelUpdateDownload(), {
+            id: 'cancel-update-download',
+            errorNotice: false,
+          }).catch(showNotice.error)
+        }
+        setOpen(false)
+      }}
       onOk={onUpdate}
     >
       <Box
@@ -425,18 +483,27 @@ export function UpdateViewer({ ref }: { ref?: Ref<DialogRef> }) {
               remarkPlugins={[remarkGitHubAlertsPlugin]}
               components={{
                 a: ({ href, children, ...props }) => {
+                  const isFragment = href?.startsWith('#') ?? false
+                  const renderedHref = isFragment
+                    ? `#${UPDATE_MARKDOWN_ID_PREFIX}${href?.slice(1)}`
+                    : href
+                      ? '#'
+                      : undefined
+
                   return (
                     <a
                       {...props}
-                      href={href ? '#' : undefined}
+                      href={renderedHref}
                       target={undefined}
                       rel={undefined}
                       onClick={(event) => {
+                        if (isFragment) return
                         event.preventDefault()
                         if (!href) return
                         openUrlWithNotice(href)
                       }}
                       onAuxClick={(event) => {
+                        if (isFragment) return
                         event.preventDefault()
                         if (event.button === 1 && href) {
                           openUrlWithNotice(href)
